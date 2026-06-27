@@ -1,0 +1,10 @@
+{
+  "id": "font-picker",
+  "name": "Font Picker",
+  "version": "0.1.0",
+  "minAppVersion": "1.0.0",
+  "description": "Quickly change the editor font from your installed macOS fonts.",
+  "author": "brain",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}
