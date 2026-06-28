@@ -7,8 +7,11 @@ const path = require('path');
 const { execFile } = require('child_process');
 
 const DEFAULT_SETTINGS = {
-	fontFamily: ''
+	fontFamily: '',
+	fontCache: null
 };
+
+const FONT_CACHE_REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 const DEFAULT_FONT_ITEM = {
 	family: '',
@@ -17,6 +20,13 @@ const DEFAULT_FONT_ITEM = {
 
 function uniqSorted(values) {
 	return Array.from(new Set(values.filter((value) => value && !value.startsWith('.')))).sort((a, b) => a.localeCompare(b));
+}
+
+function fontItemsFromFamilies(families) {
+	return uniqSorted(families).map((family) => ({
+		family,
+		label: family
+	}));
 }
 
 function cssFontFamily(fontFamily) {
@@ -55,15 +65,46 @@ function getFontNameFromFile(fileName) {
 }
 
 class FontProvider {
-	constructor() {
-		this.cachedFonts = null;
+	constructor(plugin) {
+		this.plugin = plugin;
+		this.persistentCacheUpdatedAt = 0;
+		this.cachedFonts = this.getFontsFromPersistentCache();
+		this.refreshPromise = null;
 	}
 
 	async getFonts() {
-		if (this.cachedFonts) {
+		if (this.cachedFonts.length > 0) {
 			return this.cachedFonts;
 		}
 
+		return this.refreshFonts();
+	}
+
+	getCachedFonts() {
+		return this.cachedFonts;
+	}
+
+	shouldRefreshPersistentCache() {
+		return this.cachedFonts.length === 0 || Date.now() - this.persistentCacheUpdatedAt > FONT_CACHE_REFRESH_INTERVAL_MS;
+	}
+
+	refreshCacheInBackground() {
+		if (this.refreshPromise) {
+			return this.refreshPromise;
+		}
+
+		this.refreshPromise = this.refreshFonts()
+			.catch((error) => {
+				console.debug('Font Picker: background font cache refresh failed', error);
+			})
+			.finally(() => {
+				this.refreshPromise = null;
+			});
+
+		return this.refreshPromise;
+	}
+
+	async refreshFonts() {
 		let fonts = await this.getFontsFromLocalFontAccess();
 		if (fonts.length === 0) {
 			fonts = await this.getFontsFromSystemProfiler();
@@ -72,12 +113,33 @@ class FontProvider {
 			fonts = this.getFontsFromDirectories();
 		}
 
-		this.cachedFonts = uniqSorted(fonts).map((family) => ({
-			family,
-			label: family
-		}));
+		this.cachedFonts = fontItemsFromFamilies(fonts);
+		await this.savePersistentCache();
 
 		return this.cachedFonts;
+	}
+
+	getFontsFromPersistentCache() {
+		const cache = this.plugin.settings.fontCache;
+		if (!cache || cache.platform !== process.platform || !Array.isArray(cache.fonts)) {
+			return [];
+		}
+
+		this.persistentCacheUpdatedAt = typeof cache.updatedAt === 'number' ? cache.updatedAt : 0;
+		return fontItemsFromFamilies(cache.fonts.map((font) => {
+			return typeof font === 'string' ? font : font.family;
+		}));
+	}
+
+	async savePersistentCache() {
+		this.plugin.settings.fontCache = {
+			fonts: this.cachedFonts.map((font) => font.family),
+			platform: process.platform,
+			updatedAt: Date.now()
+		};
+		this.persistentCacheUpdatedAt = this.plugin.settings.fontCache.updatedAt;
+
+		await this.plugin.saveSettings();
 	}
 
 	async getFontsFromLocalFontAccess() {
@@ -252,8 +314,8 @@ class FontPickerModal extends obsidian.FuzzySuggestModal {
 
 class FontPicker extends obsidian.Plugin {
 	async onload() {
-		this.fontProvider = new FontProvider();
 		await this.loadSettings();
+		this.fontProvider = new FontProvider(this);
 		this.addStyleElement();
 		this.applyFont(this.settings.fontFamily);
 
@@ -261,6 +323,15 @@ class FontPicker extends obsidian.Plugin {
 			id: 'change-font',
 			name: 'Change font',
 			callback: async () => {
+				const cachedFonts = this.fontProvider.getCachedFonts();
+				if (cachedFonts.length > 0) {
+					new FontPickerModal(this.app, this, cachedFonts).open();
+					if (this.fontProvider.shouldRefreshPersistentCache()) {
+						this.fontProvider.refreshCacheInBackground();
+					}
+					return;
+				}
+
 				const loadingNotice = new obsidian.Notice('Loading fonts...', 0);
 				try {
 					const fonts = await this.fontProvider.getFonts();
@@ -271,6 +342,24 @@ class FontPicker extends obsidian.Plugin {
 					loadingNotice.hide();
 					console.error('Font Picker: unable to load fonts', error);
 					new obsidian.Notice('Font Picker could not load your system fonts.');
+				}
+			}
+		});
+
+		this.addCommand({
+			id: 'refresh-font-cache',
+			name: 'Refresh font list',
+			callback: async () => {
+				const loadingNotice = new obsidian.Notice('Refreshing fonts...', 0);
+				try {
+					const fonts = await this.fontProvider.refreshFonts();
+					loadingNotice.hide();
+					new obsidian.Notice(`Font list refreshed (${fonts.length} fonts).`);
+				}
+				catch (error) {
+					loadingNotice.hide();
+					console.error('Font Picker: unable to refresh font cache', error);
+					new obsidian.Notice('Font Picker could not refresh your system fonts.');
 				}
 			}
 		});
